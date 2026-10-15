@@ -31,12 +31,18 @@ st.markdown(
         color: #888888;
         margin-bottom: 1.5rem;
     }
+    .metric-container {
+        background-color: #1a1a24;
+        border-radius: 8px;
+        padding: 15px;
+        margin-bottom: 10px;
+    }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# Robust Cache directory setup using OS temp directory (works cleanly on Streamlit Cloud)
+# Robust Cache directory setup
 CACHE_DIR = os.path.join(tempfile.gettempdir(), "fastf1_cache")
 try:
     os.makedirs(CACHE_DIR, exist_ok=True)
@@ -58,31 +64,36 @@ def get_schedule(year: int):
 
 
 @st.cache_resource(show_spinner=True)
-def load_session_data(year: int, round_number: int, session_name: str):
-    """Load and prepare a FastF1 session in-memory without pickle serialization."""
-    session = fastf1.get_session(year, round_number, session_name)
+def load_session_data(year: int, event_name: str, session_name: str):
+    """Load and prepare a FastF1 session in memory with smart fallback."""
+    session = fastf1.get_session(year, event_name, session_name)
     try:
-        session.load(telemetry=True, laps=True, weather=True)
+        # Load laps and car telemetry without slow weather/messages endpoints
+        session.load(laps=True, telemetry=True, weather=False, messages=False)
     except Exception:
+        # If full telemetry fails, load laps and classification on a fresh session
         try:
-            session.load(telemetry=False, laps=True, weather=False)
-        except Exception:
-            try:
-                session.load(telemetry=False, laps=False, weather=False)
-            except Exception:
-                pass
+            session = fastf1.get_session(year, event_name, session_name)
+            session.load(laps=True, telemetry=False, weather=False, messages=False)
+            session._telemetry_unavailable = True
+        except Exception as e_laps:
+            session._load_error = str(e_laps)
     return session
 
 
 def safe_get_laps(session):
-    """Safely retrieve session laps without throwing DataNotLoadedError."""
+    """Safely retrieve session laps with detailed error diagnosis."""
+    if hasattr(session, "_load_error") and session._load_error:
+        return None, session._load_error
     try:
+        if hasattr(session, "_laps") and session._laps is not None and not session._laps.empty:
+            return session._laps, None
         laps = session.laps
         if laps is not None and not laps.empty:
-            return laps
-    except Exception:
-        pass
-    return None
+            return laps, None
+        return None, "Lap timing records are empty for this session."
+    except Exception as err:
+        return None, str(err)
 
 
 def safe_get_results(session):
@@ -103,6 +114,12 @@ def format_timedelta(td):
     minutes = int(total_seconds // 60)
     seconds = total_seconds % 60
     return f"{minutes}:{seconds:06.3f}"
+
+
+def format_sector(td):
+    if pd.isna(td):
+        return "-"
+    return f"{td.total_seconds():.3f}s"
 
 
 # --- Header ---
@@ -137,7 +154,6 @@ if not schedule.empty:
     if not available_sessions:
         available_sessions = ["Race", "Qualifying", "Practice 1"]
 
-    # Default to 'Race' if present, otherwise the last session
     default_session_idx = available_sessions.index("Race") if "Race" in available_sessions else len(available_sessions) - 1
     selected_session = st.sidebar.selectbox("Session", available_sessions, index=default_session_idx)
 else:
@@ -146,15 +162,20 @@ else:
     selected_session = "Race"
 
 st.sidebar.markdown("---")
-st.sidebar.info("💡 **Tip:** Session data is loaded from the FastF1 API and cached in memory for quick navigation.")
+if st.sidebar.button("🔄 Clear Cache & Reload"):
+    st.cache_resource.clear()
+    st.cache_data.clear()
+    st.rerun()
+
+st.sidebar.info("💡 **Tip:** Click **Clear Cache & Reload** if you want to force fresh data from the F1 API.")
 
 # --- Load Session ---
 try:
     with st.spinner(f"Loading {selected_year} {selected_event_name} - {selected_session}..."):
-        session = load_session_data(selected_year, round_number, selected_session)
+        session = load_session_data(selected_year, selected_event_name, selected_session)
 except Exception as e:
     st.error(f"Could not load session data: {e}")
-    st.info("Try selecting a different completed session or year.")
+    st.info("Try selecting a different completed session or click 'Clear Cache & Reload'.")
     st.stop()
 
 # Basic Session Info banner
@@ -211,7 +232,7 @@ with tab_results:
 # ==========================================
 with tab_telemetry:
     st.subheader("⚡ Head-to-Head Fastest Lap Telemetry")
-    laps = safe_get_laps(session)
+    laps, laps_error = safe_get_laps(session)
     if laps is not None:
         drivers = sorted([d for d in laps["Driver"].unique() if pd.notna(d)])
         if drivers:
@@ -223,10 +244,14 @@ with tab_telemetry:
                 driver2 = st.selectbox("Driver 2", drivers, index=default_d2_idx, key="d2")
 
             try:
-                lap_d1 = laps.pick_driver(driver1).pick_fastest()
-                lap_d2 = laps.pick_driver(driver2).pick_fastest()
+                lap_d1 = laps.pick_drivers(driver1).pick_fastest()
+                lap_d2 = laps.pick_drivers(driver2).pick_fastest()
             except Exception:
-                lap_d1, lap_d2 = None, None
+                try:
+                    lap_d1 = laps.pick_driver(driver1).pick_fastest()
+                    lap_d2 = laps.pick_driver(driver2).pick_fastest()
+                except Exception:
+                    lap_d1, lap_d2 = None, None
 
             if lap_d1 is not None and lap_d2 is not None:
                 time_d1 = format_timedelta(lap_d1["LapTime"])
@@ -242,6 +267,26 @@ with tab_telemetry:
                     delta_str = f"{delta_sec:+.3f}s"
                     st.metric("Delta (D1 vs D2)", delta_str)
 
+                # Sector comparison table
+                st.markdown("##### ⏱️ Sector Times Comparison")
+                sec_df = pd.DataFrame({
+                    "Sector": ["Sector 1", "Sector 2", "Sector 3", "Total Lap Time"],
+                    f"{driver1}": [
+                        format_sector(lap_d1["Sector1Time"]),
+                        format_sector(lap_d1["Sector2Time"]),
+                        format_sector(lap_d1["Sector3Time"]),
+                        time_d1,
+                    ],
+                    f"{driver2}": [
+                        format_sector(lap_d2["Sector1Time"]),
+                        format_sector(lap_d2["Sector2Time"]),
+                        format_sector(lap_d2["Sector3Time"]),
+                        time_d2,
+                    ],
+                })
+                st.dataframe(sec_df, use_container_width=True, hide_index=True)
+
+                # Car sensor telemetry graphs (Speed, Throttle, Brake, Gear)
                 try:
                     tel_d1 = lap_d1.get_car_data().add_distance()
                     tel_d2 = lap_d2.get_car_data().add_distance()
@@ -256,6 +301,7 @@ with tab_telemetry:
                     except Exception:
                         color_d2 = "#FF1801"
 
+                    st.markdown("##### 📈 Car Telemetry Traces")
                     fig = make_subplots(
                         rows=3,
                         cols=1,
@@ -315,24 +361,30 @@ with tab_telemetry:
 
                     st.plotly_chart(fig, use_container_width=True)
 
-                except Exception as e:
-                    st.warning(f"Could not load detailed telemetry channels: {e}")
+                except Exception:
+                    st.info("ℹ️ High-frequency sensor telemetry (speed/throttle trace) is not available for this session. Showing Sector times above.")
             else:
                 st.info("Fastest lap telemetry is unavailable for one or both selected drivers.")
         else:
             st.info("No drivers found in lap data for this session.")
     else:
         st.warning("⚠️ Lap telemetry is not available for this session. Please select a completed session.")
+        if laps_error:
+            st.caption(f"Reason: {laps_error}")
 
 # ==========================================
 # TAB 3: TRACK MAP & SPEEDS
 # ==========================================
 with tab_track:
     st.subheader("🗺️ Circuit Layout & Speed Heatmap")
-    laps = safe_get_laps(session)
+    laps, _ = safe_get_laps(session)
     if laps is not None:
         try:
-            fastest_overall_lap = laps.pick_fastest()
+            try:
+                fastest_overall_lap = laps.pick_fastest()
+            except Exception:
+                fastest_overall_lap = None
+
             if fastest_overall_lap is not None:
                 pos_data = fastest_overall_lap.get_pos_data()
                 car_data = fastest_overall_lap.get_car_data()
@@ -370,8 +422,8 @@ with tab_track:
                 st.plotly_chart(fig_map, use_container_width=True)
             else:
                 st.info("No fastest lap recorded for track mapping.")
-        except Exception as e:
-            st.warning(f"Track layout could not be rendered: {e}")
+        except Exception:
+            st.info("ℹ️ Track GPS mapping data is unavailable for this session.")
     else:
         st.warning("⚠️ Track mapping requires lap telemetry data which is not available for this session.")
 
@@ -380,7 +432,7 @@ with tab_track:
 # ==========================================
 with tab_lap_chart:
     st.subheader("⏱️ Lap Time Pace Across Session")
-    laps = safe_get_laps(session)
+    laps, _ = safe_get_laps(session)
     if laps is not None:
         try:
             valid_laps = laps.pick_quicklaps()
@@ -395,7 +447,11 @@ with tab_lap_chart:
                 if selected_drivers:
                     fig_pace = go.Figure()
                     for drv in selected_drivers:
-                        drv_laps = valid_laps.pick_driver(drv)
+                        try:
+                            drv_laps = valid_laps.pick_drivers(drv)
+                        except Exception:
+                            drv_laps = valid_laps.pick_driver(drv)
+
                         try:
                             c = fastf1.plotting.driver_color(drv)
                         except Exception:
