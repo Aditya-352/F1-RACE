@@ -132,6 +132,12 @@ python main.py
 
 This will open a graphical interface where you can select the year and round of the race weekend you want to replay. This is still a new feature, so please report any issues you encounter.
 
+**STREAMLIT WEB DASHBOARD (Cloud & Local):**
+You can launch the web interface locally or deploy it directly to [Streamlit Community Cloud](https://share.streamlit.io):
+```bash
+streamlit run streamlit_app.py
+```
+
 **OPTIONAL CLI MENU:** To use the CLI menu system, you can simply run:
 ```bash
 python main.py --cli
